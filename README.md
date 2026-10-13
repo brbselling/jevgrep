@@ -130,7 +130,8 @@ Current protocols and subsequent experiments are in the
 
 Searches send eligible source content to Jev through the provider selected during auth. Default
 filesystem filtering respects ignore files and excludes hidden, dependency/build,
-binary, and obvious credential files. These filters are not a guarantee that all
+binary, and obvious credential files. Backup, log, and jsonl names, and files over
+1 MB, are skipped as well; `--include-backups` reads them. These filters are not a guarantee that all
 sensitive information has been removed; choose a search root you intend to send.
 `jg files [root]` counts the files a search under that root may read, grouped by
 top-level directory, with no provider key or network request. It takes the same

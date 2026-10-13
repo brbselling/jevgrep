@@ -656,6 +656,61 @@ test("TypeSafe admits at most 40 small requests per second through real HTTP", a
   }
 }, 10_000);
 
+test("a question-cap HTTP 400 is splittable and other 400s are not", async () => {
+  const cases = [
+    { message: "at most 8 questions", navigation: true, questions: 2, splitEligible: true },
+    {
+      message: "At most 100 questions per request",
+      navigation: true,
+      questions: 2,
+      splitEligible: true,
+    },
+    { message: "bad request", navigation: true, questions: 2, splitEligible: false },
+    { message: "at most 8 tokens", navigation: true, questions: 2, splitEligible: false },
+    { message: "at most 8 questions", navigation: false, questions: 2, splitEligible: false },
+    { message: "at most 8 questions", navigation: true, questions: 1, splitEligible: false },
+  ] as const;
+  for (const sample of cases) {
+    let calls = 0;
+    const server = Bun.serve({
+      port: 0,
+      fetch() {
+        calls++;
+        return Response.json({ message: sample.message }, { status: 400 });
+      },
+    });
+    try {
+      const evaluator = createEvaluator({
+        provider: "openrouter",
+        apiKey: "fixture",
+        fetch: routeProviderFetch(fetch, `http://127.0.0.1:${server.port}`),
+        signal: new AbortController().signal,
+      });
+      const questions = Object.fromEntries(
+        Array.from({ length: sample.questions }, (_, index) => [
+          `q${index}`,
+          { type: "boolean" as const, instructions: "Relevant?" },
+        ]),
+      );
+      await expect(
+        evaluator.evaluate(
+          { state: { source: "code" }, questions },
+          { navigation: sample.navigation },
+        ),
+      ).rejects.toMatchObject({
+        kind: "provider",
+        splitEligible: sample.splitEligible,
+        ...(sample.splitEligible
+          ? { diagnostic: { statusCode: 400, message: sample.message } }
+          : {}),
+      });
+      expect(calls).toBe(sample.navigation ? 1 : 2);
+    } finally {
+      server.stop(true);
+    }
+  }
+});
+
 test("token-queued requests revalidate source after waiting", async () => {
   let calls = 0;
   let stale = false;

@@ -334,3 +334,35 @@ export function splitSource(snapshot: Snapshot, maxBytes = 12_000): SourceUnit[]
   const text = sourceText(snapshot.source);
   return textUnits(text, { startLine: 1, endLine: text.lineCount }, "source", maxBytes, false);
 }
+
+export function isMarkdownPath(path: string) {
+  return /\.(?:md|markdown)$/i.test(path);
+}
+
+/** ATX sections stay whole. Fenced lines are not headings. Oversized sections use byte windows. */
+export function splitMarkdown(snapshot: Snapshot, maxBytes = 24_000): SourceUnit[] {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 4)
+    throw new Error("Invalid source byte allowance");
+  const text = sourceText(snapshot.source);
+  if (!snapshot.source) return [];
+  const lines = snapshot.source.split("\n");
+  const sections: Range[] = [];
+  let fence: "`" | "~" | undefined;
+  let startLine = 1;
+  const heading = (line: string) => !fence && /^ {0,3}#{1,6}[ \t]+\S/.test(line);
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]!;
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line);
+    if (marker) {
+      const kind = marker[1]![0] as "`" | "~";
+      fence = fence === kind ? undefined : (fence ?? kind);
+      continue;
+    }
+    if (index > 0 && heading(line)) {
+      sections.push({ startLine, endLine: index });
+      startLine = index + 1;
+    }
+  }
+  if (startLine <= lines.length) sections.push({ startLine, endLine: lines.length });
+  return sections.flatMap((section) => textUnits(text, section, "section", maxBytes, false));
+}

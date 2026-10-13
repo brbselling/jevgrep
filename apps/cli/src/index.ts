@@ -109,7 +109,8 @@ async function main() {
     }
     case "search": {
       const credentials = await loadCredentials();
-      const { retrieve, createEvaluator, createEvaluationCache } = await import("@repo/core");
+      const { retrieve, createEvaluator, createEvaluationCache, resolveMaxQuestions } =
+        await import("@repo/core");
       const cache = createEvaluationCache({
         directory: storageDirectory("cache"),
         enabled: !command.noCache,
@@ -128,6 +129,8 @@ async function main() {
           query: command.query,
           policy: command.policy,
           signal: controller.signal,
+          maxQuestions: resolveMaxQuestions(command.maxQuestions),
+          ...(command.mode ? { mode: command.mode } : {}),
         },
         evaluator,
       );

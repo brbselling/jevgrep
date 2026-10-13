@@ -46,12 +46,17 @@ export type RetrievalResult = {
   };
   counts: { requests: number; cacheHits: number; inspectedFiles: number };
 };
+export type SearchMode = "auto" | "docs" | "code";
 export type SearchInput = {
   root: string;
   query: string;
   policy?: FilesystemPolicy;
   signal: AbortSignal;
   protectedPaths?: string[];
+  /** Navigation and source batch size. Omitted values use JEVGREP_MAX_QUESTIONS, then 128. */
+  maxQuestions?: number;
+  /** auto picks docs when more than 70% of the visible files are .md or .txt. */
+  mode?: SearchMode;
 };
 export type Evaluator = {
   readonly requests: number;

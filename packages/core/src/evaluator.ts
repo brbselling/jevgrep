@@ -234,6 +234,9 @@ export function createEvaluator(options: {
             if (navigation && status === 429) attemptLimit = Math.max(attemptLimit, 2);
             if ((navigation && !transient) || attempt + 1 === attemptLimit) {
               const diagnostic = providerDiagnostic(error, options.apiKey);
+              // The provider's question ceiling is recoverable by halving the batch. Other 400s are not.
+              const questionCap =
+                status === 400 && /at most \d+ questions/i.test(diagnostic?.message ?? "");
               const description = diagnostic
                 ? `HTTP ${diagnostic.statusCode}${diagnostic.message ? `: ${diagnostic.message}` : ""}`
                 : name === "TimeoutError"
@@ -243,7 +246,7 @@ export function createEvaluator(options: {
                     : "Invalid or incomplete provider response";
               throw new EvaluationFailure(
                 "provider",
-                navigation && multiple && transient && status !== 429,
+                navigation && multiple && ((transient && status !== 429) || questionCap),
                 diagnostic,
                 `${description} (max concurrent requests: ${concurrency})`,
               );

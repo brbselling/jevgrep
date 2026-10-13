@@ -1,12 +1,15 @@
 import { renderResult } from "../apps/cli/src/render";
 import { routeProviderFetch } from "./fixtures/provider-route.mjs";
-import { expect } from "bun:test";
+import { expect, test } from "bun:test";
 import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { testIfDocker } from "./helpers/docker";
 import { retrieve } from "../packages/core/src/retrieve";
+import { resolveMaxQuestions } from "../packages/core/src/selection";
 import { createEvaluator, EvaluationFailure } from "../packages/core/src/evaluator";
+import type { EvaluationRequest } from "../packages/core/src/evaluator";
+import type { SearchInput } from "../packages/core/src/types";
 
 testIfDocker(
   "hierarchical retrieval returns source from multiple files without uploading excluded data",
@@ -537,5 +540,312 @@ testIfDocker(
     } finally {
       await rm(root, { recursive: true, force: true });
     }
+  },
+);
+
+test("the question batch size prefers an explicit limit, then JEVGREP_MAX_QUESTIONS, then 128", () => {
+  expect(resolveMaxQuestions(4, "2")).toBe(4);
+  expect(resolveMaxQuestions(undefined, "2")).toBe(2);
+  expect(resolveMaxQuestions(undefined, " 16 ")).toBe(16);
+  expect(resolveMaxQuestions(undefined, undefined)).toBe(128);
+  for (const raw of ["0", "nope", "", "1.5", "-3"])
+    expect(resolveMaxQuestions(undefined, raw)).toBe(128);
+  expect(() => resolveMaxQuestions(0)).toThrow("positive integer");
+  const previous = process.env.JEVGREP_MAX_QUESTIONS;
+  process.env.JEVGREP_MAX_QUESTIONS = "7";
+  try {
+    expect(resolveMaxQuestions()).toBe(7);
+  } finally {
+    if (previous === undefined) delete process.env.JEVGREP_MAX_QUESTIONS;
+    else process.env.JEVGREP_MAX_QUESTIONS = previous;
+  }
+});
+
+type RequestState = {
+  items?: Array<{ path: string; kind: string }>;
+  path?: string;
+  declarations?: Array<{ startLine: number; endLine: number }>;
+  criteria?: { relevance: string };
+  guidance?: string;
+};
+
+async function searchFixture(
+  files: Record<string, string>,
+  query: string,
+  options: Partial<Omit<SearchInput, "root" | "query" | "signal">>,
+  answer: (request: EvaluationRequest, state: RequestState) => Record<string, number>,
+) {
+  const root = await mkdtemp(join(tmpdir(), "jg-gaps-"));
+  const requests: EvaluationRequest[] = [];
+  try {
+    for (const [path, content] of Object.entries(files)) {
+      const absolute = join(root, path);
+      await mkdir(join(absolute, ".."), { recursive: true });
+      await writeFile(absolute, content);
+    }
+    let requestsMade = 0;
+    const result = await retrieve(
+      { root, query, signal: new AbortController().signal, ...options },
+      {
+        get requests() {
+          return requestsMade;
+        },
+        async evaluate(request) {
+          requestsMade++;
+          requests.push(request);
+          return answer(request, request.state as RequestState);
+        },
+      },
+    );
+    return { result, requests };
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+}
+
+function positiveAnswers(request: EvaluationRequest) {
+  return Object.fromEntries(Object.keys(request.questions).map((id) => [id, 0.9]));
+}
+
+testIfDocker("maxQuestions caps navigation batches and source declaration batches", async () => {
+  const files = Object.fromEntries(
+    ["a", "b", "c", "d", "e"].map((name) => [`${name}.ts`, "export const value = 1;\n"]),
+  );
+  const navigation = await searchFixture(
+    files,
+    "where is value",
+    { maxQuestions: 2 },
+    (request, state) => {
+      if (!state.items) return positiveAnswers(request);
+      return Object.fromEntries(state.items.map((_, index) => [`q${index}`, 0.9]));
+    },
+  );
+  const batches = navigation.requests
+    .map((request) => (request.state as RequestState).items?.length)
+    .filter((length): length is number => length !== undefined);
+  expect(batches.every((length) => length <= 2)).toBe(true);
+  expect(batches).toContain(2);
+  expect(navigation.result.files.map((file) => file.path).sort()).toEqual([
+    "a.ts",
+    "b.ts",
+    "c.ts",
+    "d.ts",
+    "e.ts",
+  ]);
+
+  const source = await searchFixture(
+    { "notes.txt": `${"alpha word\n".repeat(1500)}` },
+    "alpha word",
+    { maxQuestions: 2, mode: "code" },
+    positiveAnswers,
+  );
+  const groups = source.requests
+    .map((request) => (request.state as RequestState).declarations)
+    .filter((declarations): declarations is NonNullable<RequestState["declarations"]> =>
+      Boolean(declarations?.length),
+    );
+  expect(groups.length).toBeGreaterThan(0);
+  expect(groups.every((group) => group.length <= 2)).toBe(true);
+  expect(groups.some((group) => group.length === 2)).toBe(true);
+});
+
+testIfDocker(
+  "an HTTP 400 question cap is halved until the batch fits, and other 400s drop it",
+  async () => {
+    for (const message of ["at most 2 questions", "bad request"] as const) {
+      const root = await mkdtemp(join(tmpdir(), "jg-question-cap-"));
+      const server = Bun.serve({
+        port: 0,
+        async fetch(request) {
+          const body = (await request.json()) as {
+            state: { items?: unknown[] };
+            questions: Record<string, unknown>;
+          };
+          const count = Object.keys(body.questions).length;
+          if (body.state.items && count > 2) return Response.json({ message }, { status: 400 });
+          return Response.json({
+            answers: Object.fromEntries(
+              Object.keys(body.questions).map((id) => [id, { type: "noul", noul: 0.9 }]),
+            ),
+          });
+        },
+      });
+      try {
+        for (const name of ["a", "b", "c", "d"])
+          await writeFile(join(root, `${name}.ts`), "export const value = 1;\n");
+        const signal = new AbortController().signal;
+        const result = await retrieve(
+          { root, query: "where is value", signal },
+          createEvaluator({
+            apiKey: "fixture",
+            provider: "vercel",
+            fetch: routeProviderFetch(fetch, `http://127.0.0.1:${server.port}`),
+            signal,
+          }),
+        );
+        if (message === "at most 2 questions") {
+          expect(result.status).toBe("complete");
+          expect(result.files.map((file) => file.path).sort()).toEqual([
+            "a.ts",
+            "b.ts",
+            "c.ts",
+            "d.ts",
+          ]);
+          expect(result.issues).toEqual([]);
+        } else {
+          expect(result.status).toBe("incomplete");
+          expect(result.files).toEqual([]);
+          expect(result.issues).toContainEqual({ kind: "provider", count: 1 });
+        }
+      } finally {
+        server.stop(true);
+        await rm(root, { recursive: true, force: true });
+      }
+    }
+  },
+  30_000,
+);
+
+testIfDocker(
+  "docs mode asks for facts and auto-selects when most files are markdown or text",
+  async () => {
+    const prose = Object.fromEntries([
+      ...Array.from({ length: 8 }, (_, index) => [`note-${index}.md`, "A fact.\n"]),
+      ...Array.from({ length: 2 }, (_, index) => [`code-${index}.ts`, "export const value = 1;\n"]),
+    ]);
+    const code = Object.fromEntries([
+      ...Array.from({ length: 7 }, (_, index) => [`note-${index}.md`, "A fact.\n"]),
+      ...Array.from({ length: 3 }, (_, index) => [`code-${index}.ts`, "export const value = 1;\n"]),
+    ]);
+    const fact = "Does this block state facts, rules or decisions that answer the query?";
+    async function framingOf(files: Record<string, string>, mode?: SearchInput["mode"]) {
+      const searched = await searchFixture(
+        files,
+        "which fact is recorded",
+        { mode },
+        positiveAnswers,
+      );
+      const navigation = searched.requests.find((request) => (request.state as RequestState).items);
+      const evidence = searched.requests.find(
+        (request) => (request.state as RequestState).criteria,
+      );
+      const instruction = Object.values(navigation?.questions ?? {})[0] as { instructions: string };
+      return {
+        instruction: instruction.instructions,
+        relevance: (evidence?.state as RequestState).criteria?.relevance ?? "",
+        guidance: (evidence?.state as RequestState).guidance ?? "",
+        roles: searched.result.files[0]?.roles ?? [],
+      };
+    }
+    const docs = await framingOf(prose);
+    expect(docs.instruction).toContain("facts, rules, or decisions");
+    expect(docs.instruction).not.toContain("implementation");
+    expect(docs.relevance.startsWith(fact)).toBe(true);
+    expect(docs.guidance).not.toContain("implementing and testing");
+    expect(docs.roles).toEqual(["fact", "rule", "decision", "reference", "background"]);
+    const mixed = await framingOf(code);
+    expect(mixed.instruction).toContain("implementation");
+    expect(mixed.guidance).toContain("implementing and testing");
+    const forced = await framingOf(
+      Object.fromEntries(
+        Array.from({ length: 4 }, (_, index) => [`code-${index}.ts`, "export const value = 1;\n"]),
+      ),
+      "docs",
+    );
+    expect(forced.relevance.startsWith(fact)).toBe(true);
+    const forcedCode = await framingOf(
+      Object.fromEntries(
+        Array.from({ length: 4 }, (_, index) => [`note-${index}.md`, "A fact.\n"]),
+      ),
+      "code",
+    );
+    expect(forcedCode.instruction).toContain("implementation");
+  },
+);
+
+testIfDocker(
+  "docs mode admits filename matches above 0.4 and keeps other files at 0.5",
+  async () => {
+    const files = {
+      "other.md": "unrelated notes\n",
+      "meeting.md": "the word meeting appears once\n",
+      "debt.txt": "debt is mentioned\n",
+      "top/meeting-debt.md": "the meeting debt is 12\n",
+      "top/notes/secret.md": "DO_NOT_ADMIT\n",
+      "keep.md": "kept because the score is high\n",
+    };
+    const scores: Record<string, number> = {
+      "other.md": 0.45,
+      "meeting.md": 0.4,
+      "debt.txt": 0.41,
+      "top/meeting-debt.md": 0.45,
+      "top/notes": 0.45,
+      "keep.md": 0.8,
+    };
+    const answer = (request: EvaluationRequest, state: RequestState) => {
+      if (!state.items) return positiveAnswers(request);
+      return Object.fromEntries(
+        state.items.map((item, index) => [`q${index}`, scores[item.path] ?? 0]),
+      );
+    };
+    const docs = await searchFixture(
+      files,
+      "Where is the meeting debt recorded?",
+      { mode: "docs" },
+      answer,
+    );
+    expect(docs.result.files.map((file) => file.path).sort()).toEqual(
+      ["debt.txt", "keep.md", "top/meeting-debt.md"].sort(),
+    );
+    expect(JSON.stringify(docs.requests)).not.toContain("DO_NOT_ADMIT");
+    const code = await searchFixture(
+      files,
+      "Where is the meeting debt recorded?",
+      { mode: "code" },
+      answer,
+    );
+    expect(code.result.files.map((file) => file.path)).toEqual(["keep.md"]);
+  },
+);
+
+testIfDocker(
+  "docs mode splits markdown on headings, including headings inside fences",
+  async () => {
+    const long = `# Alpha\n${"alpha line\n".repeat(400)}# Beta\nbeta answers the query\n`;
+    const betaLine = long.split("\n").findIndex((line) => line.startsWith("# Beta")) + 1;
+    const fenced = "# Real\n\n```\n# not a heading\n```\n\n# Next\nnext section\n";
+    const nextLine = fenced.split("\n").findIndex((line) => line.startsWith("# Next")) + 1;
+    const searched = await searchFixture(
+      { "long.md": long, "fenced.md": fenced },
+      "what does beta answer",
+      { mode: "docs" },
+      positiveAnswers,
+    );
+    const starts = (path: string) =>
+      [
+        ...new Set(
+          searched.requests
+            .flatMap((request) => {
+              const state = request.state as RequestState;
+              return state.path === path ? (state.declarations ?? []) : [];
+            })
+            .map((declaration) => declaration.startLine),
+        ),
+      ].sort((a, b) => a - b);
+    expect(starts("long.md")).toEqual([1, betaLine]);
+    expect(starts("fenced.md")).toEqual([1, nextLine]);
+    const code = await searchFixture(
+      { "long.md": long },
+      "what does beta answer",
+      { mode: "code" },
+      positiveAnswers,
+    );
+    const codeStarts = code.requests
+      .flatMap((request) => {
+        const state = request.state as RequestState;
+        return state.path === "long.md" ? (state.declarations ?? []) : [];
+      })
+      .map((declaration) => declaration.startLine);
+    expect(codeStarts.some((start) => start > 1 && start < betaLine)).toBe(true);
   },
 );
