@@ -162,6 +162,52 @@ test("exclude patterns are repeatable, normalized for cache identity, and limite
     expect(() => parseCommand([...args, "--exclude", "docs"])).toThrow();
 });
 
+test("max-questions is a positive search-only batch size", () => {
+  expect(parseCommand(["question", "--max-questions", "16"])).toMatchObject({
+    kind: "search",
+    maxQuestions: 16,
+  });
+  for (const value of ["0", "-1", "1.5", "NaN", "1e2"])
+    expect(() => parseCommand(["question", `--max-questions=${value}`])).toThrow(
+      "positive integer",
+    );
+  for (const args of [
+    ["files", "--max-questions", "4"],
+    ["doctor", "--max-questions", "4"],
+    ["auth", "--max-questions", "4"],
+  ])
+    expect(() => parseCommand(args)).toThrow();
+});
+
+test("mode accepts auto, code, and docs and stays off the files command", () => {
+  expect(parseCommand(["question", "--mode", "docs"])).toMatchObject({
+    kind: "search",
+    mode: "docs",
+  });
+  expect(parseCommand(["question", "--mode", "code"])).toMatchObject({
+    kind: "search",
+    mode: "code",
+  });
+  const auto = parseCommand(["question", "--mode", "auto"]);
+  if (auto.kind !== "search") throw new Error("Expected search");
+  expect(auto.mode).toBeUndefined();
+  expect(() => parseCommand(["question", "--mode", "prose"])).toThrow("--mode");
+  expect(() => parseCommand(["files", "--mode", "docs"])).toThrow("Usage: jg files");
+});
+
+test("include-backups is a filesystem policy flag for search and files", () => {
+  expect(parseCommand(["question", "--include-backups"])).toMatchObject({
+    kind: "search",
+    policy: { includeBackups: true },
+  });
+  expect(parseCommand(["files", "notes", "--include-backups"])).toEqual({
+    kind: "files",
+    root: "notes",
+    policy: { includeBackups: true },
+  });
+  expect(() => parseCommand(["doctor", "--include-backups"])).toThrow();
+});
+
 test("exclude rejects odd trailing backslash runs but preserves escaped backslashes", () => {
   for (const command of ["question", "files"]) {
     for (const count of [1, 3, 5])

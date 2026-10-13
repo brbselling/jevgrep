@@ -177,6 +177,61 @@ test("pages count skipped entries by reason and report file sizes", async () => 
   }
 });
 
+test("backup, log, jsonl names and files over 1 MB are skipped unless includeBackups is set", async () => {
+  const exact = Buffer.alloc(1_000_000, 0x61);
+  const over = Buffer.alloc(1_000_001, 0x62);
+  const root = await fixture({
+    "keep.ts": "export const kept = true;\n",
+    "notes.bak": "backup copy\n",
+    "notes.bak-1": "older backup\n",
+    "Notes.LOG": "log line\n",
+    "nested/events.jsonl": '{"n":1}\n',
+    "backup.txt": "not a bak name\n",
+    changelog: "not a log suffix\n",
+    "exact.txt": exact,
+    "over.txt": over,
+    "old.bak/inside.ts": "nested under a backup directory\n",
+  });
+  const reader = await createFilesystem({ root, policy: { noIgnore: true } });
+  try {
+    expect(await reader.readSnapshot("keep.ts")).toMatchObject({ status: "ok" });
+    expect(await reader.readSnapshot("backup.txt")).toMatchObject({ status: "ok" });
+    expect(await reader.readSnapshot("changelog")).toMatchObject({ status: "ok" });
+    expect(await reader.readSnapshot("exact.txt")).toMatchObject({ status: "ok" });
+    for (const path of ["notes.bak", "notes.bak-1"])
+      expect(await reader.readSnapshot(path)).toMatchObject({
+        status: "excluded",
+        reason: "backup",
+      });
+    for (const path of ["Notes.LOG", "nested/events.jsonl"])
+      expect(await reader.readSnapshot(path)).toMatchObject({ status: "excluded", reason: "log" });
+    expect(await reader.readSnapshot("over.txt")).toMatchObject({
+      status: "excluded",
+      reason: "size",
+    });
+    expect(await reader.readSnapshot("old.bak/inside.ts")).toMatchObject({
+      status: "excluded",
+      reason: "backup",
+    });
+    expect((await reader.listPage()).excluded).toEqual({ backup: 3, log: 1, size: 1 });
+  } finally {
+    await reader.close();
+  }
+  const included = await createFilesystem({ root, policy: { includeBackups: true } });
+  try {
+    for (const path of [
+      "notes.bak",
+      "Notes.LOG",
+      "nested/events.jsonl",
+      "over.txt",
+      "old.bak/inside.ts",
+    ])
+      expect(await included.readSnapshot(path)).toMatchObject({ status: "ok" });
+  } finally {
+    await included.close();
+  }
+});
+
 test("exclude patterns only narrow eligibility, even with --no-ignore and repository negations", async () => {
   const root = await fixture({
     ".gitignore": "!keep.test.ts\n",

@@ -1,9 +1,11 @@
 import { EvaluationFailure } from "./evaluator";
-import { evidenceRequest, type Evidence } from "./requests";
+import { evidenceRequest, type Evidence, type SearchFraming } from "./requests";
 import {
   inspect,
+  isMarkdownPath,
   pythonNeighborhood,
   sourceForUnit,
+  splitMarkdown,
   splitSource,
   type Range,
   type SourceUnit,
@@ -14,8 +16,30 @@ import type { Snapshot } from "./filesystem";
 type Span = { start: number; end: number };
 const sourceUnitBytes = 24_000;
 export const wholeFileContextBytes = 16_000;
-export const sourceBatchSize = 128;
+export const defaultMaxQuestions = 128;
 export const sourceConfidenceBoundary = 0.7;
+export type SelectionOptions = {
+  maxQuestions?: number;
+  framing?: SearchFraming;
+};
+
+/** Explicit limit, then JEVGREP_MAX_QUESTIONS, then 128. Invalid env values use the default. */
+export function resolveMaxQuestions(
+  explicit?: number,
+  envValue: string | undefined = process.env.JEVGREP_MAX_QUESTIONS,
+) {
+  if (explicit !== undefined) {
+    if (!Number.isSafeInteger(explicit) || explicit < 1)
+      throw new Error("maxQuestions must be a positive integer");
+    return explicit;
+  }
+  const raw = envValue?.trim();
+  if (raw && /^\d+$/.test(raw)) {
+    const value = Number(raw);
+    if (Number.isSafeInteger(value) && value >= 1) return value;
+  }
+  return defaultMaxQuestions;
+}
 export type SelectionResult = {
   file: FileEvidence;
   declarations: Array<Pick<SourceUnit, "name" | "range">>;
@@ -44,7 +68,10 @@ export async function selectFile(
   prepare?: () => Promise<{ evidence?: Evidence[] } | null>,
   previous?: FileEvidence,
   signal?: AbortSignal,
+  options?: SelectionOptions,
 ): Promise<SelectionResult> {
+  const batchLimit = resolveMaxQuestions(options?.maxQuestions);
+  const framing = options?.framing ?? "code";
   const issues = new Map<string, number>();
   let providerFailure: string | undefined;
   const warn = (kind: string) => issues.set(kind, (issues.get(kind) ?? 0) + 1);
@@ -101,7 +128,11 @@ export async function selectFile(
   // Giant lines retain byte coordinates; ordinary fallback uses complete-source line fragments.
   let units = syntax.units;
   if (!giantLine && (syntax.mode === "text" || units.every((unit) => unit.partial))) {
-    units = splitSource(snapshot, 3000).map((unit) => ({
+    const chunks =
+      framing === "docs" && isMarkdownPath(snapshot.path)
+        ? splitMarkdown(snapshot, sourceUnitBytes)
+        : splitSource(snapshot, 3000);
+    units = chunks.map((unit) => ({
       ...unit,
       range: {
         ...unit.range,
@@ -149,7 +180,7 @@ export async function selectFile(
   for (const unit of units) {
     if (
       pending.length &&
-      (pending.length >= sourceBatchSize ||
+      (pending.length >= batchLimit ||
         Buffer.byteLength(
           lines.slice(pending[0]!.range.startLine - 1, unit.range.endLine).join("\n"),
         ) > 42000)
@@ -196,6 +227,7 @@ export async function selectFile(
         context,
         group.map((unit) => ({ name: unit.name, ...unit.range })),
         prepared.evidence,
+        framing,
       );
       // Shared evidence contributes to the state limit as well as local source.
       if (group.length > 1 && Buffer.byteLength(JSON.stringify(request.state)) > 80_000) {

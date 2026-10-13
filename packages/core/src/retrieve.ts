@@ -1,7 +1,14 @@
 import { basename, extname } from "node:path";
 import { createFilesystem, type Snapshot, type DirectoryEntry } from "./filesystem";
 import { type EvaluationRequest, EvaluationFailure } from "./evaluator";
-import { inspect, pythonPreview, sourceForUnit, splitSource } from "./source";
+import {
+  inspect,
+  isMarkdownPath,
+  pythonPreview,
+  sourceForUnit,
+  splitMarkdown,
+  splitSource,
+} from "./source";
 import {
   navigationRequest,
   fileAssessmentRequest,
@@ -9,11 +16,12 @@ import {
   type FilePreview,
   type NavigationItem,
   type Evidence,
+  type SearchFraming,
 } from "./requests";
 import {
   selectFile,
   wholeFileContextBytes,
-  sourceBatchSize,
+  resolveMaxQuestions,
   sourceConfidenceBoundary,
   type SelectionResult,
 } from "./selection";
@@ -25,21 +33,35 @@ import type { Evaluator, FileEvidence, RetrievalResult, SearchInput } from "./ty
 // Bound per-stage source work; the evaluator separately caps shared provider attempts.
 const stageWorkers = 32;
 const relevanceBoundary = 0.5;
+const docsNameBoundary = 0.4;
+const docFileMajority = 0.7;
 const weakScoreCeiling = 0.6;
 const minimumPositiveScores = 32;
 export const navigationByteBudget = 8_000_000;
+const docExtensions = new Set([".md", ".txt"]);
+function filenameMatchesQuery(path: string, query: string) {
+  const name = basename(path).toLowerCase();
+  const terms = query.toLowerCase().match(/[a-z0-9]{4,}/g);
+  return terms?.some((term) => name.includes(term)) ?? false;
+}
 function navigationAdmissions<T extends { score: number }>(
   classified: T[],
   hasStrongEvidence: boolean,
+  boundaryForEntry: (entry: T) => number = () => relevanceBoundary,
 ) {
   const suppressWeak =
     !hasStrongEvidence &&
     classified.filter(({ score }) => score > relevanceBoundary && score < weakScoreCeiling)
       .length >= minimumPositiveScores;
   return {
-    admitted: classified.filter(
-      ({ score }) => score >= weakScoreCeiling || (!suppressWeak && score > relevanceBoundary),
-    ),
+    admitted: classified.filter((entry) => {
+      const floor = boundaryForEntry(entry);
+      if (entry.score >= weakScoreCeiling) return true;
+      if (entry.score <= floor) return false;
+      // A filename match may sit below the normal boundary without joining the weak-score flood.
+      if (entry.score <= relevanceBoundary) return true;
+      return !suppressWeak;
+    }),
     suppressWeak,
   };
 }
@@ -51,6 +73,38 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
     signal: input.signal,
     protectedPaths: input.protectedPaths,
   });
+  const maxQuestions = resolveMaxQuestions(input.maxQuestions);
+  let framing: SearchFraming = input.mode === "docs" ? "docs" : "code";
+  let framingLocked = input.mode === "docs" || input.mode === "code";
+  const framedPaths = new Set<string>();
+  let docFiles = 0;
+  let otherFiles = 0;
+  function addExtension(extension: string, count: number) {
+    if (docExtensions.has(extension)) docFiles += count;
+    else otherFiles += count;
+  }
+  // Auto locks on the first filenames it can see. Later directories do not flip the framing.
+  function observe(items: NavigationItem[]) {
+    if (framingLocked) return;
+    for (const item of items) {
+      if (item.kind === "file") {
+        if (framedPaths.has(item.path)) continue;
+        framedPaths.add(item.path);
+        addExtension(extname(item.path).toLowerCase(), 1);
+      } else
+        for (const [extension, count] of Object.entries(item.childPreview?.sampledExtensions ?? {}))
+          addExtension(extension.toLowerCase(), count);
+    }
+    const total = docFiles + otherFiles;
+    if (total === 0) return;
+    framing = docFiles / total > docFileMajority ? "docs" : "code";
+    framingLocked = true;
+  }
+  function boundaryFor(item: NavigationItem) {
+    if (framing !== "docs" || item.kind !== "file" || !filenameMatchesQuery(item.path, input.query))
+      return relevanceBoundary;
+    return docsNameBoundary;
+  }
   const issues = new Map<string, number>();
   let providerFailure: string | undefined;
   const inspected = new Set<string>();
@@ -108,22 +162,22 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
     return result.snapshot;
   }
   async function score(items: NavigationItem[], anchor?: { path: string; classes: string[] }) {
+    observe(items);
+    const frame = framing;
+    const navigationFor = (batch: NavigationItem[]) =>
+      navigationRequest(input.query, batch, anchor, frame);
     const results: Array<{ item: NavigationItem; score: number }> = [];
     const batches: NavigationItem[][] = [];
     let batch: NavigationItem[] = [];
     for (const item of items) {
-      if (
-        Buffer.byteLength(JSON.stringify(navigationRequest(input.query, [item], anchor))) > 38_000
-      ) {
+      if (Buffer.byteLength(JSON.stringify(navigationFor([item]))) > 38_000) {
         issue("request-size");
         continue;
       }
       if (
         batch.length &&
-        (batch.length >= 128 ||
-          Buffer.byteLength(
-            JSON.stringify(navigationRequest(input.query, [...batch, item], anchor)),
-          ) > 38_000)
+        (batch.length >= maxQuestions ||
+          Buffer.byteLength(JSON.stringify(navigationFor([...batch, item]))) > 38_000)
       ) {
         batches.push(batch);
         batch = [];
@@ -134,7 +188,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
     let budgetPaused = false;
     async function scoreGroup(group: NavigationItem[]) {
       try {
-        const request = navigationRequest(input.query, group, anchor);
+        const request = navigationFor(group);
         const requestBytes = Buffer.byteLength(JSON.stringify(request));
         if (
           !confidentSourceSeen &&
@@ -152,7 +206,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
         group.forEach((item, index) => {
           const probability = scores[`q${index}`]!;
           if (probability >= weakScoreCeiling) strongScoreSeen = true;
-          if (probability > relevanceBoundary) positiveScoresSeen++;
+          if (probability > boundaryFor(item)) positiveScoresSeen++;
           results.push({ item, score: probability });
         });
         await confirmSource(group.map((item, index) => ({ item, score: scores[`q${index}`]! })));
@@ -420,6 +474,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
           }
         }
       }
+      observe(items);
       const previewsToScore: NavigationItem[] = [];
       const previewsToExpand: NavigationItem[] = [];
       for (const item of items) {
@@ -427,7 +482,9 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
           item.kind === "file" &&
           item.filePreview &&
           item.filePreview.sizeBytes <= 1_000_000 &&
-          Buffer.byteLength(JSON.stringify(navigationRequest(input.query, [item], anchor))) > 38_000
+          Buffer.byteLength(
+            JSON.stringify(navigationRequest(input.query, [item], anchor, framing)),
+          ) > 38_000
         )
           previewsToExpand.push(item);
         else previewsToScore.push(item);
@@ -440,7 +497,11 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
         if (!source) continue;
         // Requests too large for preview scoring are split into bounded chunks.
         // Otherwise admission uses the preview; unseen source may still be relevant.
-        for (const chunk of splitSource(source, 12_000)) {
+        const chunks =
+          framing === "docs" && isMarkdownPath(source.path)
+            ? splitMarkdown(source, 12_000)
+            : splitSource(source, 12_000);
+        for (const chunk of chunks) {
           const text = sourceForUnit(source, chunk);
           remaining.push(
             buffered(
@@ -462,7 +523,11 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
         }
       }
       classified.push(...(await score(remaining, anchor)));
-      const { admitted, suppressWeak } = navigationAdmissions(classified, strongScoreSeen);
+      const { admitted, suppressWeak } = navigationAdmissions(
+        classified,
+        strongScoreSeen,
+        (entry) => boundaryFor(entry.item),
+      );
       for (const { item, score: probability } of admitted) {
         if (item.kind === "directory") {
           directories.push(item.path);
@@ -479,7 +544,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
       for (const { item, score: probability } of classified)
         if (
           item.kind === "directory" &&
-          (probability <= relevanceBoundary || (suppressWeak && probability < weakScoreCeiling)) &&
+          (probability <= boundaryFor(item) || (suppressWeak && probability < weakScoreCeiling)) &&
           !anchor
         )
           pruned.set(item.path, item);
@@ -553,6 +618,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
       },
       previous,
       input.signal,
+      { maxQuestions, framing },
     );
     for (const entry of selection.issues)
       if (entry.kind !== "source-invalid")
@@ -595,7 +661,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
       return;
     if (!finalProbe) {
       const syntax = await inspect(source, { signal: input.signal });
-      if (syntax.units.length > sourceBatchSize) return;
+      if (syntax.units.length > maxQuestions) return;
     }
     const selection = await selectSource(candidate, source);
     if (!selection) return;
@@ -660,9 +726,8 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
           if (stop) break;
           items.push(await withDirectoryContent(item));
         }
-        const seeds = navigationAdmissions(
-          await score(items, anchor),
-          strongScoreSeen,
+        const seeds = navigationAdmissions(await score(items, anchor), strongScoreSeen, (entry) =>
+          boundaryFor(entry.item),
         ).admitted.map((decision) => decision.item.path);
         await discover(seeds, anchor);
       }
@@ -748,7 +813,7 @@ export async function retrieve(input: SearchInput, evaluator: Evaluator): Promis
           const preview = previews.get(candidate.path)!;
           try {
             const scores = await freshEvaluation(
-              fileAssessmentRequest(input.query, candidate.path, preview),
+              fileAssessmentRequest(input.query, candidate.path, preview, framing),
               [candidate],
             );
             assessments.set(candidate.path, {

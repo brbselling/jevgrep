@@ -13,6 +13,8 @@ export type FilesystemPolicy = {
   includeSensitive?: boolean;
   /** Root-relative gitignore patterns that only narrow eligibility; repository rules cannot re-admit them. */
   exclude?: readonly string[];
+  /** Read backup, log, and jsonl names, and files over the default size skip. */
+  includeBackups?: boolean;
 };
 export type Snapshot = Readonly<{ path: string; contentHash: string; source: string }>;
 export type FilesystemIssue = {
@@ -63,6 +65,11 @@ export const filesystemDefaults = Object.freeze({
     ".pypirc",
   ] as readonly string[],
   sensitiveSuffixes: [".pem", ".key", ".p12", ".pfx"] as readonly string[],
+  /** Gitignore patterns skipped unless includeBackups is set. Case-insensitive. */
+  backupPatterns: ["*.bak*"] as readonly string[],
+  logPatterns: ["*.log", "*.jsonl"] as readonly string[],
+  /** Files larger than this are skipped unless includeBackups is set. */
+  maxDefaultFileBytes: 1_000_000,
   pageSize: 128,
   maxOpenDirectories: 64,
   maxFileBytes: 16 * 1024 * 1024,
@@ -131,6 +138,10 @@ export async function createFilesystem(options: FilesystemOptions) {
   if (!rootStat.isDirectory()) throw new Error("Search root must be a directory");
   const policy = Object.freeze({ ...options.policy });
   const excludeRules = policy.exclude?.length ? ignore().add(policy.exclude) : undefined;
+  const backupNames = policy.includeBackups
+    ? undefined
+    : ignore().add(filesystemDefaults.backupPatterns);
+  const logNames = policy.includeBackups ? undefined : ignore().add(filesystemDefaults.logPatterns);
   const limits = { ...filesystemDefaults, ...options.limits };
   for (const name of [
     "pageSize",
@@ -341,6 +352,15 @@ export async function createFilesystem(options: FilesystemOptions) {
         const rootRelative = components.slice(0, index + 1).join("/");
         if (excludeRules?.ignores(rootRelative + (stat.isDirectory() ? "/" : "")))
           return excluded("exclude_pattern");
+        const relativeName = rootRelative + (stat.isDirectory() ? "/" : "");
+        if (backupNames?.ignores(relativeName)) return excluded("backup");
+        if (logNames?.ignores(relativeName)) return excluded("log");
+        if (
+          !policy.includeBackups &&
+          stat.isFile() &&
+          stat.size > BigInt(filesystemDefaults.maxDefaultFileBytes)
+        )
+          return excluded("size");
         if (index === components.length - 1)
           return { status: "eligible", ...named, stat, ancestors };
         if (!stat.isDirectory()) return excluded("not_directory");
