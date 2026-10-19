@@ -4,6 +4,7 @@ import { lstat, open, opendir, realpath } from "node:fs/promises";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import ignore, { type Ignore } from "ignore";
 import { storageDirectory } from "./storage";
+import { containsLikelySecret } from "./secrets";
 
 /** These independent switches broaden only their named exclusion category. */
 export type FilesystemPolicy = {
@@ -64,9 +65,9 @@ export const filesystemDefaults = Object.freeze({
     ".npmrc",
     ".pypirc",
   ] as readonly string[],
-  sensitiveSuffixes: [".pem", ".key", ".p12", ".pfx"] as readonly string[],
+  sensitiveSuffixes: [".env", ".pem", ".key", ".p12", ".pfx"] as readonly string[],
   /** Gitignore patterns skipped unless includeBackups is set. Case-insensitive. */
-  backupPatterns: ["*.bak*"] as readonly string[],
+  backupPatterns: ["*.bak*", "*~", "*.orig"] as readonly string[],
   logPatterns: ["*.log", "*.jsonl"] as readonly string[],
   /** Files larger than this are skipped unless includeBackups is set. */
   maxDefaultFileBytes: 1_000_000,
@@ -74,6 +75,8 @@ export const filesystemDefaults = Object.freeze({
   maxOpenDirectories: 64,
   maxFileBytes: 16 * 1024 * 1024,
   maxIgnoreBytes: 1024 * 1024,
+  /** Source bytes of earlier snapshots retained for identity-checked reuse. */
+  maxReusableBytes: 32 * 1024 * 1024,
 });
 export type FilesystemOptions = {
   root: string;
@@ -83,11 +86,17 @@ export type FilesystemOptions = {
   limits?: Partial<
     Pick<
       typeof filesystemDefaults,
-      "pageSize" | "maxOpenDirectories" | "maxFileBytes" | "maxIgnoreBytes"
+      "pageSize" | "maxOpenDirectories" | "maxFileBytes" | "maxIgnoreBytes" | "maxReusableBytes"
     >
   >;
   signal?: AbortSignal;
+  /** Wall-clock milliseconds, compared with file timestamps; injectable for tests. */
+  now?: () => number;
 };
+/** Timestamps are coarse on some filesystems (two seconds on FAT). A write in the same tick as a
+ * read can leave a file's identity unchanged, so only a file whose last change is older than this
+ * margin at the start of its read can later be recognized by identity alone. */
+const recentChangeNs = 3_000_000_000n;
 
 type Scope = { directory: string; git?: Ignore; search?: Ignore };
 type Eligible = {
@@ -148,10 +157,12 @@ export async function createFilesystem(options: FilesystemOptions) {
     "maxOpenDirectories",
     "maxFileBytes",
     "maxIgnoreBytes",
+    "maxReusableBytes",
   ] as const) {
     if (!Number.isSafeInteger(limits[name]) || limits[name] < 1)
       throw new Error(`Invalid filesystem limit: ${name}`);
   }
+  const now = options.now ?? (() => Date.now());
   const protectedPaths = await Promise.all(
     [storageDirectory("config"), storageDirectory("cache"), ...(options.protectedPaths ?? [])].map(
       async (path) => {
@@ -238,9 +249,17 @@ export async function createFilesystem(options: FilesystemOptions) {
     }
   }
   // Search-local reuse; eviction only requires reparsing, never changes eligibility.
-  const ruleCache = new Map<string, { stat: BigIntStats; rules: Ignore }>();
+  // A same-size rewrite can keep device, inode, size, and both timestamps on a coarse
+  // clock, so a stat match still has to compare bytes before the parsed rules are reused.
+  const ruleCache = new Map<string, { rules: Ignore; hash: string }>();
   async function ruleFile(directory: string, name: string): Promise<Ignore | Issue | undefined> {
     const absolute = join(directory, name);
+    const identity = {
+      status: "eligible" as const,
+      path: relative(root, absolute),
+      absolute,
+      ancestors: [] as Eligible["ancestors"],
+    };
     try {
       const stat = await lstat(absolute, { bigint: true });
       if (!stat.isFile() || stat.isSymbolicLink()) {
@@ -248,30 +267,18 @@ export async function createFilesystem(options: FilesystemOptions) {
         return undefined;
       }
       const cached = ruleCache.get(absolute);
-      if (cached && same(cached.stat, stat)) {
-        if (
-          !(await stable({
-            status: "eligible",
-            path: relative(root, absolute),
-            absolute,
-            stat,
-            ancestors: [],
-          }))
-        )
-          return issue("changed", relative(root, absolute));
+      const bytes = await readBytes({ ...identity, stat }, limits.maxIgnoreBytes);
+      if (bytes.status === "issue") return bytes;
+      const hash = createHash("sha256").update(bytes.bytes).digest("hex");
+      if (cached && cached.hash === hash) {
         ruleCache.delete(absolute);
         ruleCache.set(absolute, cached);
         return cached.rules;
       }
-      const bytes = await readBytes(
-        { status: "eligible", path: relative(root, absolute), absolute, stat, ancestors: [] },
-        limits.maxIgnoreBytes,
-      );
-      if (bytes.status === "issue") return bytes;
       try {
         const rules = ignore().add(new TextDecoder("utf-8", { fatal: true }).decode(bytes.bytes));
         ruleCache.delete(absolute);
-        ruleCache.set(absolute, { stat, rules });
+        ruleCache.set(absolute, { rules, hash });
         if (ruleCache.size > 64) ruleCache.delete(ruleCache.keys().next().value!);
         return rules;
       } catch {
@@ -379,10 +386,70 @@ export async function createFilesystem(options: FilesystemOptions) {
     if (result.status !== "eligible") return result;
     return result.stat.isFile() ? { status: "file" as const } : excluded("not_file");
   }
-  async function readSnapshot(path: string): Promise<SnapshotResult> {
+  type Reusable = { snapshot: Snapshot; stat: BigIntStats; bytes: number };
+  // Trusted earlier reads, least recently used first; bounded by source bytes.
+  const reusable = new Map<string, Reusable>();
+  let reusableBytes = 0;
+  function forget(path: string) {
+    const entry = reusable.get(path);
+    if (!entry) return;
+    reusable.delete(path);
+    reusableBytes -= entry.bytes;
+  }
+  function retain(path: string, entry: Reusable) {
+    forget(path);
+    if (entry.bytes > limits.maxReusableBytes) return;
+    reusable.set(path, entry);
+    reusableBytes += entry.bytes;
+    for (const [oldest, value] of reusable) {
+      if (reusableBytes <= limits.maxReusableBytes) break;
+      reusable.delete(oldest);
+      reusableBytes -= value.bytes;
+    }
+  }
+  /** Compares identity without reading bytes. Opening, unlike lstat alone, revalidates attributes
+   * that network filesystems cache between clients. */
+  async function sameFile(identity: Eligible, known: BigIntStats) {
+    if (!same(known, identity.stat) || stopped(identity.path) !== undefined) return false;
+    let handle;
+    try {
+      handle = await open(
+        identity.absolute,
+        constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+      );
+      const current = await handle.stat({ bigint: true });
+      return current.isFile() && same(known, current);
+    } catch {
+      return false;
+    } finally {
+      await handle?.close();
+    }
+  }
+  /** Eligibility is evaluated on every call. With `reuse`, a file whose identity (device, inode,
+   * size, modification and change times) matches a trusted earlier read returns that snapshot
+   * instead of being reread and rehashed; any other file is read again. */
+  async function readSnapshot(
+    path: string,
+    options: { reuse?: boolean } = {},
+  ): Promise<SnapshotResult> {
+    const started = BigInt(Math.floor(now())) * 1_000_000n;
     const admitted = await eligibility(path);
-    if (admitted.status !== "eligible") return admitted;
-    if (!admitted.stat.isFile()) return excluded("not_file");
+    if (admitted.status !== "eligible") {
+      const named = pathName(path);
+      if (named) forget(named.path);
+      return admitted;
+    }
+    if (!admitted.stat.isFile()) {
+      forget(admitted.path);
+      return excluded("not_file");
+    }
+    const known = reusable.get(admitted.path);
+    if (options.reuse && known && (await sameFile(admitted, known.stat))) {
+      reusable.delete(admitted.path);
+      reusable.set(admitted.path, known);
+      return { status: "ok", snapshot: known.snapshot };
+    }
+    forget(admitted.path);
     const read = await readBytes(admitted, limits.maxFileBytes);
     if (read.status !== "ok") return read;
     const current = await eligibility(path);
@@ -398,14 +465,17 @@ export async function createFilesystem(options: FilesystemOptions) {
     }
     if (!policy.includeSensitive && /-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY-----/.test(source))
       return excluded("private_key");
-    return {
-      status: "ok",
-      snapshot: Object.freeze({
-        path: admitted.path,
-        source,
-        contentHash: createHash("sha256").update(read.bytes).digest("hex"),
-      }),
-    };
+    if (!policy.includeSensitive && containsLikelySecret(source))
+      return excluded("sensitive_content");
+    const snapshot = Object.freeze({
+      path: admitted.path,
+      source,
+      contentHash: createHash("sha256").update(read.bytes).digest("hex"),
+    });
+    const { mtimeNs, ctimeNs } = admitted.stat;
+    if ((mtimeNs > ctimeNs ? mtimeNs : ctimeNs) + recentChangeNs < started)
+      retain(admitted.path, { snapshot, stat: admitted.stat, bytes: read.bytes.length });
+    return { status: "ok", snapshot };
   }
   async function discard(token: string) {
     const cursor = cursors.get(token);
@@ -502,6 +572,8 @@ export async function createFilesystem(options: FilesystemOptions) {
   async function close() {
     closed = true;
     ruleCache.clear();
+    reusable.clear();
+    reusableBytes = 0;
     await Promise.all([...cursors.keys()].map(discard));
   }
   return { root, readSnapshot, lookupFile, listPage, closeCursor: discard, close };

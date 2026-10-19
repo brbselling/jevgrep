@@ -47,6 +47,7 @@ export type RetrievalResult = {
   counts: { requests: number; cacheHits: number; inspectedFiles: number };
 };
 export type SearchMode = "auto" | "docs" | "code";
+export type ProgressSnapshot = { files: number; bytes: number };
 export type SearchInput = {
   root: string;
   query: string;
@@ -55,8 +56,9 @@ export type SearchInput = {
   protectedPaths?: string[];
   /** Navigation and source batch size. Omitted values use JEVGREP_MAX_QUESTIONS, then 128. */
   maxQuestions?: number;
-  /** auto picks docs when more than 70% of the visible files are .md or .txt. */
+  /** auto picks docs when more than 70% of the first navigation batch is .md or .txt. */
   mode?: SearchMode;
+  progress?: (snapshot: ProgressSnapshot) => void;
 };
 export type Evaluator = {
   readonly requests: number;

@@ -4,4 +4,10 @@ export { createEvaluationCache } from "./cache";
 export { inventory } from "./inventory";
 export type { Inventory } from "./inventory";
 export { resolveMaxQuestions, defaultMaxQuestions } from "./selection";
-export type { SearchInput, SearchMode, RetrievalResult, FileEvidence } from "./types";
+export type {
+  SearchInput,
+  SearchMode,
+  RetrievalResult,
+  FileEvidence,
+  ProgressSnapshot,
+} from "./types";
